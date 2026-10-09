@@ -10,22 +10,24 @@ import comfy.utils
 
 
 def _audio_logits(model, x, audio_start, audio_end, eos_token=None):
-    input = x[:, -1:]
+    input = x[:, -1, :]
     module = model.embed_tokens
 
+    # one GEMV over the eos row (just below the audio codes) and the audio rows, in the
+    # table's own dtype: the whole vocab table cast to fp32 is ~1.8 GB on the 2B LM
+    start = audio_start if eos_token is None else eos_token
     offload_stream = None
     if module.comfy_cast_weights:
-        weight, _, offload_stream = comfy.ops.cast_bias_weight(module, input, offloadable=True)
+        weight, _, offload_stream = comfy.ops.cast_bias_weight(module, device=input.device, dtype=module.weight.dtype, offloadable=True)
     else:
-        weight = module.weight.to(x)
+        weight = module.weight
+    logits = comfy.ops.dense_linear(input, weight[start:audio_end])
+    comfy.ops.uncast_bias_weight(module, weight, None, offload_stream)
 
-    logits = torch.nn.functional.linear(input, weight[audio_start:audio_end], None)[:, -1]
     eos_logits = None
     if eos_token is not None:
-        eos_logits = torch.nn.functional.linear(input, weight[eos_token:eos_token + 1], None)[:, -1]
-
-    comfy.ops.uncast_bias_weight(module, weight, None, offload_stream)
-    return logits, eos_logits
+        eos_logits = logits[:, :1]
+    return logits[:, audio_start - start:], eos_logits
 
 
 def _sample_audio_token(model, x, cfg_scale, temperature, top_p, top_k, min_p, generator, audio_start_id, audio_end_id, eos_token_id):

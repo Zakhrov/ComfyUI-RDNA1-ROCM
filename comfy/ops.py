@@ -584,8 +584,10 @@ class disable_weight_init:
             return None
 
         def forward_comfy_cast_weights(self, input):
-            with CastBiasWeightContext(self, input, offloadable=True) as (weight, bias):
-                return torch.nn.functional.linear(input, weight, bias)
+            # the packed GEMM takes the weight in fp16: cast straight to it instead of via input's dtype
+            dtype = torch.float16 if len(self.weight_function) == 0 and _packed_linear_wanted(input, self.weight) else None
+            with CastBiasWeightContext(self, input, dtype=dtype, bias_dtype=input.dtype, offloadable=True) as (weight, bias):
+                return dense_linear(input, weight, bias)
 
         def forward(self, *args, **kwargs):
             run_every_op()
@@ -1026,11 +1028,11 @@ _PACKED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 def _packed_linear_wanted(x, weight):
     """kitchen's packed-fp16 GEMM replaces the vendor GEMM on devices where it is faster (gfx90c,
-    gfx1010: ~6 TFLOPS against ~2.5 fp32 and ~2.2 fp16 on gfx1010). Up to 8 rows stay on the
-    vendor GEMV, which the packed kernel would only hand back."""
+    gfx1010: ~6 TFLOPS against ~2.5 fp32 and ~2.2 fp16 on gfx1010). Up to 8 rows run its fp16
+    weight GEMV in fp32 math, so decode reads the weight as fp16 without an fp32 copy."""
     return (_CK_PACKED and x.is_cuda and not comfy.model_management.in_training
             and x.dtype in _PACKED_DTYPES and weight.dtype in _PACKED_DTYPES
-            and not isinstance(weight, QuantizedTensor) and x.numel() > 8 * x.shape[-1]
+            and not isinstance(weight, QuantizedTensor)
             and quant_ops.ck.fp16_packed_linear_is_accelerated(x.device))
 
 
@@ -1041,7 +1043,7 @@ def dense_linear(x, weight, bias=None):
     if _packed_linear_wanted(x, weight):
         weight = weight.to(dtype=torch.float16, memory_format=torch.contiguous_format)
         return quant_ops.ck.fp16_packed_linear(x, weight, bias, out_dtype=x.dtype)
-    return torch.nn.functional.linear(x, weight, bias)
+    return torch.nn.functional.linear(x, weight.to(x.dtype), bias)
 
 
 def _packed_conv_wanted(conv, x, weight):
