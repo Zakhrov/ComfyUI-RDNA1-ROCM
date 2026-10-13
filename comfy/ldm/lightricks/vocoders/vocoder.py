@@ -82,7 +82,7 @@ class LowPassFilter1d(nn.Module):
         _, C, _ = x.shape
         if self.padding:
             x = F.pad(x, (self.pad_left, self.pad_right), mode=self.padding_mode)
-        return F.conv1d(x, comfy.model_management.cast_to(self.filter.expand(C, -1, -1), dtype=x.dtype, device=x.device), stride=self.stride, groups=C)
+        return comfy.ops.depthwise_conv1d(x, comfy.model_management.cast_to(self.filter.expand(C, -1, -1), dtype=x.dtype, device=x.device), self.stride)
 
 
 class UpSample1d(nn.Module):
@@ -124,8 +124,8 @@ class UpSample1d(nn.Module):
     def forward(self, x):
         _, C, _ = x.shape
         x = F.pad(x, (self.pad, self.pad), mode="replicate")
-        x = self.ratio * F.conv_transpose1d(
-            x, comfy.model_management.cast_to(self.filter.expand(C, -1, -1), dtype=x.dtype, device=x.device), stride=self.stride, groups=C
+        x = self.ratio * comfy.ops.depthwise_conv_transpose1d(
+            x, comfy.model_management.cast_to(self.filter.expand(C, -1, -1), dtype=x.dtype, device=x.device), self.stride
         )
         x = x[..., self.pad_left : -self.pad_right]
         return x

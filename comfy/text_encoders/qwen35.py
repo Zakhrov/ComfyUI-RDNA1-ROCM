@@ -681,7 +681,7 @@ class Qwen35VisionModel(nn.Module):
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-        optimized_attention = optimized_attention_for_device(x.device, mask=False, small_input=True)
+        optimized_attention = optimized_attention_for_device(x.device, mask=False)
         deepstack_features = []
         for layer_num, blk in enumerate(self.blocks):
             x = blk(x, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings, optimized_attention=optimized_attention)
@@ -783,9 +783,10 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
 
         def verify_logits(x):
             if not head.comfy_cast_weights:
-                return F.linear(x, head.weight.to(x), None)
-            with comfy.ops.CastBiasWeightContext(head, x, offloadable=True) as (w, _bias):
-                return F.linear(x, w)
+                return comfy.ops.dense_linear(x, head.weight)
+            dtype = torch.float16 if len(head.weight_function) == 0 and comfy.ops._packed_linear_wanted(x, head.weight) else None
+            with comfy.ops.CastBiasWeightContext(head, x, dtype=dtype, offloadable=True) as (w, _bias):
+                return comfy.ops.dense_linear(x, w)
 
         generator = None
         if sampling is not None:

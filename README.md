@@ -44,6 +44,49 @@ ComfyUI is the AI creation engine for visual professionals who demand control ov
 - The most sophisticated workflows can be exposed through a simple UI thanks to App Mode.
 - It integrates seamlessly into production pipelines with our API endpoints.
 
+## This fork: RDNA1 (gfx1010)
+
+This fork targets the RX 5600M class of GPU (RDNA1, `gfx1010`, 6 GB), optionally beside
+a Vega APU (`gfx90c`). It pairs with the comfy-kitchen fork's `rdna1` backend
+(see `comfy-kitchen/comfy_kitchen/backends/rdna1/README.md`) and the
+ComfyUI-MultiGPU fork.
+
+How the pieces fit, against comfy-kitchen's plain eager backend (stock PyTorch ops,
+no working INT8 matmul and no INT8 attention on gfx1010):
+
+- **comfy-kitchen `rdna1`** supplies kernels built for a GPU with no matrix cores, dot
+  instructions or bf16: a register-blocked GEMM, packed fp16 linear and conv, and INT8
+  attention. On upstream ComfyUI it only changes attention: SD1.5 runs 16% faster and in
+  ~1.5 GB less VRAM.
+- **This fork** routes ComfyUI's fp16 linears and convs to those kernels as well, which
+  upstream does not: SD1.5 sampling goes from 1.20 it/s (eager) to 1.86 it/s.
+- **ComfyUI-MultiGPU** streams models that do not fit in 6 GB through the same kernels;
+  its streamed execution requires the rdna1 path and ck-attention. Z-Image Turbo runs at
+  normal VRAM, and SDXL in 1.9 GB.
+
+The Vega iGPU only stores weights in these workflows; nothing computes on it.
+
+512x512 text to image on a Dell G5 15 SE (RX 5600M + Ryzen Vega APU), PyTorch 2.12 ROCm
+nightly, `--disable-cuda-malloc --disable-dynamic-vram`, 2026-10-09. Cold includes model
+loading; warm is a second prompt with a new seed.
+
+| | Upstream, kitchen eager, sub-quadratic | Upstream, rdna1, `--use-ck-attention` | This fork, rdna1, `--use-ck-attention` | This fork + MultiGPU, both GPUs |
+|---|---|---|---|---|
+| SD1.5, 20 steps: cold / warm, peak VRAM | 20.6 / 18.8 s, 4.0-4.4 GB | 17.8 / 15.8 s, 2.7-2.8 GB | 14.9 / 12.7 s, 2.6-2.7 GB | 16.8 / 13.0 s, 2.4 GB |
+| SDXL, 20 steps: cold / warm, peak VRAM | 37.9 / 34.4 s, 5.4-5.6 GB | 36.4 / 32.9 s, 5.4-5.5 GB | 35.3 / 30.8 s, 5.3-5.5 GB | 45.3 / 35.4 s, 1.9 GB |
+| Z-Image Turbo, 9 steps | out of memory | out of memory | out of memory | 74.6 / 29.6 s, 2.6 GB warm |
+| Z-Image Turbo with `--lowvram` | 147.5 / 65.5 s | 138.7 / 65.4 s | 111.8 / 33.2 s | not needed |
+
+- Upstream ComfyUI does not run on this GPU at its defaults: dynamic VRAM fails on the
+  first model load (`VBAR allocation failed`), so every column uses `--disable-dynamic-vram`.
+- Z-Image Turbo runs out of memory in its Q8_0 GGUF text encoder at normal VRAM. The
+  MultiGPU column splits that encoder across both GPUs and RAM and streams the UNet
+  (`z_image_turbo_int8_convrot.safetensors`; the other columns use the Q8_0 GGUF).
+- MultiGPU streams SDXL's UNet from the iGPU and RAM: 15% slower sampling, 3.5 GB less VRAM.
+- With the Q8_0 GGUF UNet instead, the MultiGPU Z-Image run took 56.4 / 30.3 s: within 5%
+  of the int8 safetensors once loaded.
+- Full setup, per-step rates and caveats are in the rdna1 backend README.
+
 ## Get Started
 
 ### Local

@@ -1133,9 +1133,11 @@ class BaseGenerate:
             module = self.model.embed_tokens
 
         if not module.comfy_cast_weights:
-            return torch.nn.functional.linear(input, module.weight.to(x), None)
-        with comfy.ops.CastBiasWeightContext(module, input, offloadable=True) as (weight, _bias):
-            return torch.nn.functional.linear(input, weight, None)
+            return comfy.ops.dense_linear(input, module.weight)
+        # the packed GEMV reads the table as fp16: cast straight to it instead of via input's dtype
+        dtype = torch.float16 if len(module.weight_function) == 0 and comfy.ops._packed_linear_wanted(input, module.weight) else None
+        with comfy.ops.CastBiasWeightContext(module, input, dtype=dtype, offloadable=True) as (weight, _bias):
+            return comfy.ops.dense_linear(input, weight)
 
     def init_kv_cache(self, batch, max_cache_len, device, execution_dtype):
         return self.model.init_kv_cache(batch, max_cache_len, device, execution_dtype)
@@ -1288,11 +1290,12 @@ class BaseQwen3:
 
         offload_stream = None
         if module.comfy_cast_weights:
-            weight, _, offload_stream = comfy.ops.cast_bias_weight(module, input, offloadable=True)
+            dtype = torch.float16 if len(module.weight_function) == 0 and comfy.ops._packed_linear_wanted(input, module.weight) else None
+            weight, _, offload_stream = comfy.ops.cast_bias_weight(module, input, dtype=dtype, offloadable=True)
         else:
-            weight = self.model.embed_tokens.weight.to(x)
+            weight = module.weight
 
-        x = torch.nn.functional.linear(input, weight, None)
+        x = comfy.ops.dense_linear(input, weight)
 
         comfy.ops.uncast_bias_weight(module, weight, None, offload_stream)
         return x

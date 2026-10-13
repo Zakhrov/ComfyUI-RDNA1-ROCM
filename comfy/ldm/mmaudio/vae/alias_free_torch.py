@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import comfy.model_management
+import comfy.ops
 
 if 'sinc' in dir(torch):
     sinc = torch.sinc
@@ -87,8 +88,8 @@ class LowPassFilter1d(nn.Module):
         if self.padding:
             x = F.pad(x, (self.pad_left, self.pad_right),
                       mode=self.padding_mode)
-        out = F.conv1d(x, comfy.model_management.cast_to(self.filter.expand(C, -1, -1), dtype=x.dtype, device=x.device),
-                       stride=self.stride, groups=C)
+        out = comfy.ops.depthwise_conv1d(x, comfy.model_management.cast_to(self.filter.expand(C, -1, -1), dtype=x.dtype, device=x.device),
+                                         self.stride)
 
         return out
 
@@ -112,8 +113,8 @@ class UpSample1d(nn.Module):
         _, C, _ = x.shape
 
         x = F.pad(x, (self.pad, self.pad), mode='replicate')
-        x = self.ratio * F.conv_transpose1d(
-            x, comfy.model_management.cast_to(self.filter.expand(C, -1, -1), dtype=x.dtype, device=x.device), stride=self.stride, groups=C)
+        x = self.ratio * comfy.ops.depthwise_conv_transpose1d(
+            x, comfy.model_management.cast_to(self.filter.expand(C, -1, -1), dtype=x.dtype, device=x.device), self.stride)
         x = x[..., self.pad_left:-self.pad_right]
 
         return x

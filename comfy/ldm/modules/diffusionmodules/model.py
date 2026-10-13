@@ -252,12 +252,12 @@ def slice_attention(q, k, v):
             slice_size = q.shape[1] // steps if (q.shape[1] % steps) == 0 else q.shape[1]
             for i in range(0, q.shape[1], slice_size):
                 end = i + slice_size
-                s1 = torch.bmm(q[:, i:end], k) * scale
+                s1 = comfy.ops.dense_bmm(q[:, i:end], k.transpose(1, 2)) * scale
 
-                s2 = torch.nn.functional.softmax(s1, dim=2).permute(0,2,1)
+                s2 = torch.nn.functional.softmax(s1, dim=2)
                 del s1
 
-                r1[:, :, i:end] = torch.bmm(v, s2)
+                r1[:, :, i:end] = comfy.ops.dense_bmm(v, s2)
                 del s2
             break
         except Exception as e:

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import torch
+from torch.nn.modules.utils import _pair
 from enum import Enum
 import math
 import os
@@ -384,8 +385,8 @@ class ControlLoraOps:
         def forward(self, input):
             with comfy.ops.CastBiasWeightContext(self, input, offloadable=True) as (weight, bias):
                 if self.up is None:
-                    return torch.nn.functional.linear(input, weight, bias)
-                return torch.nn.functional.linear(input, weight + (torch.mm(self.up.flatten(start_dim=1), self.down.flatten(start_dim=1))).reshape(self.weight.shape).type(input.dtype), bias)
+                    return comfy.ops.dense_linear(input, weight, bias)
+                return comfy.ops.dense_linear(input, weight + (torch.mm(self.up.flatten(start_dim=1), self.down.flatten(start_dim=1))).reshape(self.weight.shape).type(input.dtype), bias)
 
     class Conv2d(torch.nn.Module, comfy.ops.CastWeightBiasOp):
         def __init__(
@@ -406,9 +407,9 @@ class ControlLoraOps:
             self.in_channels = in_channels
             self.out_channels = out_channels
             self.kernel_size = kernel_size
-            self.stride = stride
-            self.padding = padding
-            self.dilation = dilation
+            self.stride = _pair(stride)
+            self.padding = _pair(padding)
+            self.dilation = _pair(dilation)
             self.transposed = False
             self.output_padding = 0
             self.groups = groups
@@ -422,10 +423,13 @@ class ControlLoraOps:
 
         def forward(self, input):
             weight, bias, offload_stream = comfy.ops.cast_bias_weight(self, input, offloadable=True)
+            w = weight
             if self.up is not None:
-                x = torch.nn.functional.conv2d(input, weight + (torch.mm(self.up.flatten(start_dim=1), self.down.flatten(start_dim=1))).reshape(self.weight.shape).type(input.dtype), bias, self.stride, self.padding, self.dilation, self.groups)
+                w = weight + (torch.mm(self.up.flatten(start_dim=1), self.down.flatten(start_dim=1))).reshape(self.weight.shape).type(input.dtype)
+            if comfy.ops._packed_conv_wanted(self, input, w):
+                x = comfy.ops.dense_conv(input, w, bias, self.stride, self.padding, self.dilation)
             else:
-                x = torch.nn.functional.conv2d(input, weight, bias, self.stride, self.padding, self.dilation, self.groups)
+                x = torch.nn.functional.conv2d(input, w, bias, self.stride, self.padding, self.dilation, self.groups)
             comfy.ops.uncast_bias_weight(self, weight, bias, offload_stream)
             return x
 

@@ -16,6 +16,7 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+import math
 import torch
 import logging
 import contextlib
@@ -594,13 +595,15 @@ class disable_weight_init:
             if self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0:
                 return self.forward_comfy_cast_weights(*args, **kwargs)
             else:
-                return super().forward(*args, **kwargs)
+                return dense_linear(*args, self.weight, self.bias)
 
     class Conv1d(torch.nn.Conv1d, CastWeightBiasOp):
         def reset_parameters(self):
             return None
 
         def _conv_forward(self, input, weight, bias):
+            if _direct_conv_wanted(self, input, weight):
+                return direct_conv(input, weight, bias, self.stride, self.padding, self.dilation)
             if _packed_conv_wanted(self, input, weight):
                 return dense_conv(input, weight, bias, self.stride, self.padding, self.dilation)
             return super()._conv_forward(input, weight, bias)
@@ -621,6 +624,8 @@ class disable_weight_init:
             return None
 
         def _conv_forward(self, input, weight, bias):
+            if _direct_conv_wanted(self, input, weight):
+                return direct_conv(input, weight, bias, self.stride, self.padding, self.dilation)
             if _packed_conv_wanted(self, input, weight):
                 return dense_conv(input, weight, bias, self.stride, self.padding, self.dilation)
             return super()._conv_forward(input, weight, bias)
@@ -643,6 +648,10 @@ class disable_weight_init:
         def _conv_forward(self, input, weight, bias, autopad=None, *args, **kwargs):
             if autopad == "causal_zero":
                 weight = weight[:, :, -input.shape[2]:, :, :]
+            if _linear_conv_wanted(self, input, weight):
+                return dense_linear(input.flatten(1), weight.flatten(1), bias).reshape(input.shape[0], -1, 1, 1, 1)
+            if _direct_conv_wanted(self, input, weight):
+                return direct_conv(input, weight, bias, self.stride, self.padding, self.dilation)
             if _packed_conv_wanted(self, input, weight):
                 return dense_conv(input, weight, bias, self.stride, self.padding, self.dilation)
             if NVIDIA_MEMORY_CONV_BUG_WORKAROUND and weight.dtype in (torch.float16, torch.bfloat16):
@@ -741,16 +750,15 @@ class disable_weight_init:
                 num_spatial_dims, self.dilation)
 
             with CastBiasWeightContext(self, input, offloadable=True) as (weight, bias):
+                if _packed_conv_transpose_wanted(self, input, weight):
+                    return dense_conv_transpose(input, weight, bias, self.stride, self.padding, output_padding)
                 return torch.nn.functional.conv_transpose2d(
                        input, weight, bias, self.stride, self.padding,
                        output_padding, self.groups, self.dilation)
 
         def forward(self, *args, **kwargs):
             run_every_op()
-            if self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0:
-                return self.forward_comfy_cast_weights(*args, **kwargs)
-            else:
-                return super().forward(*args, **kwargs)
+            return self.forward_comfy_cast_weights(*args, **kwargs)
 
     class ConvTranspose1d(torch.nn.ConvTranspose1d, CastWeightBiasOp):
         def reset_parameters(self):
@@ -763,16 +771,15 @@ class disable_weight_init:
                 num_spatial_dims, self.dilation)
 
             with CastBiasWeightContext(self, input, offloadable=True) as (weight, bias):
+                if _packed_conv_transpose_wanted(self, input, weight):
+                    return dense_conv_transpose(input, weight, bias, self.stride, self.padding, output_padding)
                 return torch.nn.functional.conv_transpose1d(
                        input, weight, bias, self.stride, self.padding,
                        output_padding, self.groups, self.dilation)
 
         def forward(self, *args, **kwargs):
             run_every_op()
-            if self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0:
-                return self.forward_comfy_cast_weights(*args, **kwargs)
-            else:
-                return super().forward(*args, **kwargs)
+            return self.forward_comfy_cast_weights(*args, **kwargs)
 
     class Embedding(torch.nn.Embedding, CastWeightBiasOp):
         def __init__(self, num_embeddings, embedding_dim, padding_idx=None, max_norm=None,
@@ -1029,10 +1036,19 @@ _PACKED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 def _packed_linear_wanted(x, weight):
     """kitchen's packed-fp16 GEMM replaces the vendor GEMM on devices where it is faster (gfx90c,
     gfx1010: ~6 TFLOPS against ~2.5 fp32 and ~2.2 fp16 on gfx1010). Up to 8 rows run its fp16
-    weight GEMV in fp32 math, so decode reads the weight as fp16 without an fp32 copy."""
+    weight GEMV in fp32 math, so decode reads the weight as fp16 without an fp32 copy. Past 8
+    rows its scaling pass and second launch put its floor near 0.15 ms against rocBLAS's 0.1, so a
+    small GEMM over a short K and a narrow output stays on rocBLAS (0.5-0.95x below these bounds).
+    From 512 rows it is ahead earlier, at 2**27 products into at least 320 outputs (0.75-0.95x
+    rocBLAS's time in every dtype, e.g. an attention projection of 4096 tokens at 320 channels);
+    a 128-wide output there is 1.1-1.4x slower, the scaling pass over x outweighing the GEMM."""
+    products = x.numel() * weight.shape[0]
     return (_CK_PACKED and x.is_cuda and not comfy.model_management.in_training
             and x.dtype in _PACKED_DTYPES and weight.dtype in _PACKED_DTYPES
             and not isinstance(weight, QuantizedTensor)
+            and (weight.shape[1] >= 1024 or weight.shape[0] >= 8192 or x.numel() <= 8 * x.shape[-1]
+                 or products >= (2 ** 30 if x.dtype == torch.float32 else 2 ** 29)
+                 or (products >= 2 ** 27 and weight.shape[0] >= 320 and x.numel() >= 512 * x.shape[-1]))
             and quant_ops.ck.fp16_packed_linear_is_accelerated(x.device))
 
 
@@ -1046,16 +1062,97 @@ def dense_linear(x, weight, bias=None):
     return torch.nn.functional.linear(x, weight.to(x.dtype), bias)
 
 
+def _linear_conv_wanted(conv, x, weight):
+    """A conv whose kernel spans its whole unpadded input, as a patch embed over pre-cut patches
+    (Qwen's vision tower: 4096 patches of 3x2x16x16), is a GEMM over the flattened patch. The
+    packed GEMM takes it where it would take that linear; MIOpen otherwise loads for this one
+    conv, with 70 MB of kernels on gfx1010."""
+    return (x.shape[2:] == weight.shape[2:] and conv.groups == 1 and not isinstance(conv.padding, str)
+            and not any(conv.padding) and _packed_linear_wanted(x.flatten(1), weight.flatten(1)))
+
+
+def _packed_bmm_wanted(a, b_t):
+    """rocBLAS on gfx1010 runs a bf16 bmm at a fraction of its fp32 rate (113 ms against 4.8 for
+    the VAE attention scores of 4096 tokens; the packed GEMM takes 4.6), and an fp32 bmm with a
+    transposed second operand at 0.6x its plain rate, where the packed GEMM is 1.8-2.2x faster
+    from 4096 tokens and level at 1024. It reads that operand as its weight, in place when
+    contiguous. A plain fp32 bmm stays on rocBLAS (0.94x)."""
+    return (_CK_PACKED and a.is_cuda and not comfy.model_management.in_training
+            and a.dtype in _PACKED_DTYPES and b_t.dtype == a.dtype
+            and (a.dtype != torch.float32 or (b_t.is_contiguous() and a.numel() * b_t.shape[1] >= 2 ** 32))
+            and quant_ops.ck.fp16_packed_linear_is_accelerated(a.device))
+
+
+def dense_bmm(a, b_t):
+    """``bmm(a, b_t.transpose(1, 2))`` for a [B, M, K] and b_t [B, N, K], on kitchen's packed-fp16
+    GEMM where that is faster, b_t taken to fp16 as dense_linear takes its weight."""
+    if _packed_bmm_wanted(a, b_t):
+        # .to() returns an fp16 view as it is, strides included
+        out = [quant_ops.ck.fp16_packed_linear(x, w.to(dtype=torch.float16, memory_format=torch.contiguous_format).contiguous(),
+                                               None, out_dtype=a.dtype) for x, w in zip(a, b_t)]
+        return out[0].unsqueeze(0) if len(out) == 1 else torch.stack(out)
+    return torch.bmm(a, b_t.transpose(1, 2))
+
+
 def _packed_conv_wanted(conv, x, weight):
     """kitchen's packed conv3d runs on the packed-fp16 GEMM where _packed_linear_wanted would, as
     an implicit GEMM: no im2col workspace (MIOpen's fp32 one is 9x a 3x3 conv's input), 3-4.5x
     MIOpen's fp16 conv at Wan VAE shapes and up to 40x its dilated fp32 conv1d at audio VAE shapes
-    on gfx1010. Its gather reads 32 input channels at a time. The conv runs on weight's device."""
+    on gfx1010. Its gather reads 32 input channels at a time, zero-padding other counts up to
+    that: MIOpen stays ahead once more than a third of them is padding (2-12x at RGB and latent
+    conv_in shapes). MIOpen also keeps the 1x1 convs of a channels-first x, a plain GEMM over x
+    as it lies where the packed one first transposes it (0.3-0.95x; a channels-last x is read
+    in place), and the fp32 2D convs its Winograd kernels serve (0.35-0.85x). The conv runs on
+    weight's device."""
     return (_CK_PACKED and weight.is_cuda and not comfy.model_management.in_training
             and x.dtype in _PACKED_DTYPES and weight.dtype in _PACKED_DTYPES
-            and not isinstance(weight, QuantizedTensor) and x.shape[1] % 32 == 0
+            and not isinstance(weight, QuantizedTensor) and -(-x.shape[1] // 32) * 24 <= x.shape[1]
             and conv.groups == 1 and conv.padding_mode == "zeros" and not isinstance(conv.padding, str)
+            and (weight[0, 0].numel() > 1 or not x.is_contiguous()) and not _miopen_conv2d_wanted(conv, x, weight)
             and quant_ops.ck.fp16_packed_linear_is_accelerated(weight.device))
+
+
+def _miopen_conv2d_wanted(conv, x, weight):
+    """MIOpen's fp32 2D kernels (Winograd for 3x3) outrun the packed conv up to 5x5 filters and
+    under 128 input channels. Its GEMM solver may instead take an im2col workspace of x's size
+    per filter tap, which has run tiled VAE decodes out of memory here, so a conv whose
+    workspace would not fit twice over stays on the packed conv."""
+    if x.dtype != torch.float32 or weight.dim() != 4 or any(d != 1 for d in conv.dilation):
+        return False
+    if max(weight.shape[2:]) > 5 and x.shape[1] >= 128:
+        return False
+    workspace = x.numel() * weight[0, 0].numel() * 4 // (conv.stride[0] * conv.stride[1])
+    return workspace < 2 ** 28 or 2 * workspace <= comfy.model_management.get_free_memory(weight.device)
+
+
+def _direct_conv_wanted(conv, x, weight):
+    """kitchen's direct conv reads x in place in fp32 math, for the convs the packed one serves
+    badly on gfx1010. At most 8 output channels (an RGB or latent head): 2.7-3.4x the packed conv,
+    2-6x MIOpen's fp16 conv, and level with its fp32 one from 512x512 positions (1.5-2.4x behind
+    below, so those stay on MIOpen). Few input channels (conv_in): 0.4-0.85x MIOpen's time up to
+    64 patch elements in fp32, and level with its fp16 conv up to 160, at stride 1 (its 8-wide
+    load; 1.2x MIOpen's time at stride 2)."""
+    if not (_CK_PACKED and weight.is_cuda and not comfy.model_management.in_training
+            and x.dtype in _PACKED_DTYPES and weight.dtype in _PACKED_DTYPES
+            and not isinstance(weight, QuantizedTensor)
+            and conv.groups == 1 and conv.padding_mode == "zeros" and not isinstance(conv.padding, str)
+            and quant_ops.ck.fp16_packed_linear_is_accelerated(weight.device)):
+        return False
+    fp32 = x.dtype == torch.float32
+    if math.prod(weight.shape[1:]) <= (64 if fp32 else 160) and conv.stride[-1] == 1:
+        return True
+    return weight.shape[0] <= 8 and (not fp32 or math.prod(x.shape[2:]) >= 2 ** 18 * math.prod(conv.stride))
+
+
+def direct_conv(x, weight, bias, stride, padding, dilation):
+    """conv1d, conv2d or conv3d on kitchen's direct conv3d, in x's dtype, the missing leading
+    spatial dims as size one."""
+    lead = (1,) * (5 - x.dim())
+    zeros = tuple(0 for _ in lead)
+    out = quant_ops.ck.direct_conv3d(x.reshape(*x.shape[:2], *lead, *x.shape[2:]),
+                                     weight.reshape(*weight.shape[:2], *lead, *weight.shape[2:]), bias,
+                                     (*lead, *stride), (*zeros, *padding), (*lead, *dilation))
+    return out.reshape(*out.shape[:2], *out.shape[2 + len(lead):])
 
 
 def dense_conv(x, weight, bias, stride, padding, dilation):
@@ -1073,6 +1170,57 @@ def dense_conv(x, weight, bias, stride, padding, dilation):
     out = quant_ops.ck.fp16_packed_conv3d(x, weight, bias, (*lead, *stride), (*zeros, *padding),
                                           (*lead, *dilation))[:, :k]
     return out.reshape(*out.shape[:2], *out.shape[2 + len(lead):])
+
+
+def _packed_conv_transpose_wanted(conv, x, weight):
+    """kitchen's packed transposed conv runs one stride-1 implicit GEMM per output phase: 13-25x
+    MIOpen's fp16 transposed conv at audio VAE upsampler shapes on gfx1010. Inputs of up to 640
+    positions stay on MIOpen: its fp16 path is still quick there and the per-call re-layout of
+    the weight costs more than the GEMM (0.2-0.7x). MIOpen's fp32 path does not fall off, so
+    fp32 inputs come here only from 1024 channels and 4096 positions (1.1-1.35x, 0.5-1.0x
+    below). The epilogue writes 8 output channels at a time."""
+    positions = x.numel() // x.shape[1]
+    return (_CK_PACKED and weight.is_cuda and not comfy.model_management.in_training
+            and x.dtype in _PACKED_DTYPES and weight.dtype in _PACKED_DTYPES
+            and not isinstance(weight, QuantizedTensor) and -(-x.shape[1] // 32) * 24 <= x.shape[1]
+            and positions > (640 if x.dtype != torch.float32 else 4095)
+            and (x.dtype != torch.float32 or x.shape[1] >= 1024)
+            and conv.groups == 1 and weight.shape[1] % 8 == 0 and all(d == 1 for d in conv.dilation)
+            and quant_ops.ck.fp16_packed_linear_is_accelerated(weight.device))
+
+
+def dense_conv_transpose(x, weight, bias, stride, padding, output_padding):
+    """conv_transpose1d, 2d or 3d on kitchen's packed transposed conv3d, in x's dtype, the
+    missing leading spatial dims as size one. The weight is taken to fp16 as in dense_linear."""
+    lead = (1,) * (5 - x.dim())
+    x = x.reshape(*x.shape[:2], *lead, *x.shape[2:])
+    weight = weight.to(torch.float16).reshape(*weight.shape[:2], *lead, *weight.shape[2:])
+    zeros = tuple(0 for _ in lead)
+    out = quant_ops.ck.fp16_packed_conv_transpose3d(x, weight, bias, (*lead, *stride), (*zeros, *padding),
+                                                    (*zeros, *output_padding))
+    return out.reshape(*out.shape[:2], *out.shape[2 + len(lead):])
+
+
+def _depthwise_wanted(x):
+    """kitchen's depthwise kernel gathers each output's taps in one pass: 1.6-2.1x MIOpen's
+    transposed depthwise conv and 0.8-2.0x its forward one at vocoder filter shapes on gfx1010
+    (level within 0.03 ms where it trails, on tensors under a millisecond)."""
+    return (_CK_PACKED and x.is_cuda and not comfy.model_management.in_training
+            and x.dtype in _PACKED_DTYPES and quant_ops.ck.fp16_packed_linear_is_accelerated(x.device))
+
+
+def depthwise_conv1d(x, weight, stride):
+    """conv1d of x [N, C, L] with one [1, taps] filter per channel, no padding."""
+    if _depthwise_wanted(x):
+        return quant_ops.ck.depthwise_conv3d(x[:, :, None, None], weight[:, :, None, None], None, (1, 1, stride)).flatten(2)
+    return torch.nn.functional.conv1d(x, weight, stride=stride, groups=x.shape[1])
+
+
+def depthwise_conv_transpose1d(x, weight, stride):
+    """conv_transpose1d of x [N, C, L] with one [1, taps] filter per channel, no padding."""
+    if _depthwise_wanted(x):
+        return quant_ops.ck.depthwise_conv_transpose3d(x[:, :, None, None], weight[:, :, None, None], None, (1, 1, stride)).flatten(2)
+    return torch.nn.functional.conv_transpose1d(x, weight, stride=stride, groups=x.shape[1])
 
 
 def _fp16_linear_wanted(x):

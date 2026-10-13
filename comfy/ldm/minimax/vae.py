@@ -40,10 +40,14 @@ LATENTS_STD = [
 
 def _kitchen_ndhwc(x):
     # NDHWC when the kitchen pad kernel can feed it and the conv consumes it natively:
-    # cuDNN does, MIOpen converts back and loses more than the fused pad saves
+    # cuDNN does, and kitchen's packed conv reads an fp16 one in place; MIOpen converts back
+    # and loses more than the fused pad saves
     ck = getattr(comfy.quant_ops, "ck", None)
-    return (ck is not None and hasattr(ck, "group_norm_silu_pad3d") and torch.version.hip is None
-            and x.is_cuda and x.dtype in (torch.float16, torch.bfloat16))
+    if ck is None or not hasattr(ck, "group_norm_silu_pad3d") or not x.is_cuda:
+        return False
+    if torch.version.hip is None:
+        return x.dtype in (torch.float16, torch.bfloat16)
+    return x.dtype == torch.float16 and ck.fp16_packed_linear_is_accelerated(x.device)
 
 
 def _fused_norm_pad(x, norm, spatial_pad, front):
@@ -101,7 +105,7 @@ class CausalConv3d(ops.Conv3d):
         if x.shape[2] == 1 and pad_t:
             # single frame: the causal front padding is all zeros truncate the temporal taps instead of convolving zero frames
             out = super().forward(x, autopad="causal_zero")
-        elif ndhwc:
+        elif ndhwc and torch.version.hip is None:
             # cast_bias_weight handles offloaded layers; channels_last keeps cuDNN's output NDHWC
             weight, bias, offload_stream = comfy.ops.cast_bias_weight(self, x, offloadable=True)
             try:
