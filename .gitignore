@@ -10,6 +10,8 @@ __pycache__/
 extra_model_paths.yaml
 /.vs
 .vscode/
+build/
+comfy-kitchen/build/
 .idea/
 venv*/
 .venv/
