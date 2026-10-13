@@ -1,0 +1,4 @@
+[submodule "comfy-kitchen"]
+	path = comfy-kitchen
+	url = https://github.com/Zakhrov/comfy-kitchen.git
+	branch = rdna1-backend

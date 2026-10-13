@@ -46,10 +46,72 @@ ComfyUI is the AI creation engine for visual professionals who demand control ov
 
 ## This fork: RDNA1 (gfx1010)
 
-This fork targets the RX 5600M class of GPU (RDNA1, `gfx1010`, 6 GB), optionally beside
-a Vega APU (`gfx90c`). It pairs with the comfy-kitchen fork's `rdna1` backend
-(see `comfy-kitchen/comfy_kitchen/backends/rdna1/README.md`) and the
-ComfyUI-MultiGPU fork.
+This is a hard fork of [ComfyUI](https://github.com/Comfy-Org/ComfyUI) for the RX 5600M
+class of GPU (RDNA1, `gfx1010`, 6 GB), optionally beside a Vega APU (`gfx90c`). It carries
+the [comfy-kitchen fork](https://github.com/Zakhrov/comfy-kitchen) as the `comfy-kitchen`
+submodule (branch `rdna1-backend`), built from source for its `rdna1` backend (see
+[the backend's README](comfy-kitchen/comfy_kitchen/backends/rdna1/README.md)), and pairs
+with the ComfyUI-MultiGPU fork.
+
+### Install
+
+The comfy-kitchen PyPI wheel has no `rdna1` backend, so `requirements.txt` installs the
+submodule as an editable package and compiles the backend into the source tree. That
+needs a ROCm compiler, found through `ROCM_HOME`, `/opt/rocm` or `amdclang++`/`hipcc` on
+`PATH`, and takes a few minutes. Without one the install still succeeds but has no
+`rdna1` backend: check for `Found comfy_kitchen backend rdna1` in the startup log.
+
+```bash
+git clone https://github.com/Zakhrov/ComfyUI-RDNA1-ROCM.git
+cd ComfyUI-RDNA1-ROCM
+git submodule update --init
+
+uv venv
+uv pip install --extra-index-url https://nightly.repo.amd.com/rocm/whl-next/ "rocm[device-gfx90c,device-gfx1010]" "torch[device-gfx90c,device-gfx1010]==2.12" torchaudio==2.11 "torchvision[device-gfx90c,device-gfx1010]==0.27"
+uv pip install --extra-index-url https://nightly.repo.amd.com/rocm/whl-next/ -r requirements.txt
+uv run main.py --disable-dynamic-vram --use-ck-attention
+```
+
+- Drop the `device-gfx90c` extras on a machine without the Vega APU.
+- Do not pass `--recursive` to the submodule update: comfy-kitchen's own submodules
+  (CUTLASS, flash-attention) are only read by its CUDA backend.
+- The build runs in an isolated environment that cannot see the GPU. uv takes the target
+  from `[tool.uv.extra-build-variables]` in `pyproject.toml`; with pip, set it yourself:
+  `COMFY_HIP_ARCHS=gfx1010 pip install -r requirements.txt`.
+- After pulling, run `git submodule update` to move comfy-kitchen to the recorded commit.
+  If its native sources (`.hip`, `.cpp`, `.h`) changed, rebuild incrementally from
+  `comfy-kitchen/`: `COMFY_HIP_ARCHS=gfx1010 ../.venv/bin/python setup.py build_ext --inplace`.
+  Python changes need no rebuild.
+
+### Changes from upstream
+
+Every path below is taken only where comfy-kitchen reports its packed fp16 kernels as
+accelerated for the tensor's device, and never while training; elsewhere the code runs
+upstream's torch ops.
+
+- **Linear layers** (`comfy/ops.py`): plain fp32, fp16 and bf16 linears run on kitchen's
+  packed fp16 GEMM in place of rocBLAS, above the size where it is faster. The weight is
+  cast straight to fp16 rather than through the input's dtype.
+- **Convolutions** (`comfy/ops.py`): Conv1d, Conv2d, Conv3d and the transposed convs run
+  on kitchen's packed and direct conv kernels in place of MIOpen. A Conv3d whose kernel
+  covers its whole input runs as a linear.
+- **Depthwise 1D resampling**: the anti-aliasing filters in the LTXV vocoder, the MMAudio
+  VAE and the MiniMax audio VAE use kitchen's depthwise conv kernels.
+- **VAE attention** (`comfy/ldm/modules/diffusionmodules/model.py`): the sliced attention
+  fallback runs its two matrix products on the packed GEMM.
+- **MiniMax H3 VAE**: fp16 decode uses kitchen's fused group norm, SiLU and pad on ROCm,
+  and the tiled decode canvas is kept on the intermediate device so finished tiles leave
+  VRAM.
+- **Text-encoder LM heads** (`comfy/text_encoders/llama.py`, `qwen35.py`, `ace15.py`):
+  logits read the vocabulary table as fp16 through the packed GEMV instead of casting
+  the whole table to fp32 (about 1.8 GB on the ACE-Step 1.5 2B LM). ACE-Step audio-code
+  sampling computes only the EOS and audio-code rows.
+- **LoRA** (`comfy/weight_adapter/lora.py`, `comfy/controlnet.py`): LoRA weight merges
+  and control LoRA layers use the same linear and conv paths.
+- **Uploads** (`folder_paths.py`): `text/xsl` and `text/x-xslt` are added to the blocked
+  content types, as some distributions map `.xsl` to them.
+
+### Results
 
 How the pieces fit, against comfy-kitchen's plain eager backend (stock PyTorch ops,
 no working INT8 matmul and no INT8 attention on gfx1010):

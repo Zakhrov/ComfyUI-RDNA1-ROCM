@@ -10,6 +10,10 @@ homepage = "https://www.comfy.org/"
 repository = "https://github.com/comfyanonymous/ComfyUI"
 documentation = "https://docs.comfy.org/"
 
+# pip has no equivalent: set COMFY_HIP_ARCHS=gfx1010 in the environment instead.
+[tool.uv.extra-build-variables]
+comfy-kitchen = { COMFY_HIP_ARCHS = "gfx1010" }
+
 [tool.ruff]
 lint.select = [
   "N805", # invalid-first-argument-name-for-method
