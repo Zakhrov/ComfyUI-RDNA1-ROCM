@@ -92,9 +92,29 @@ upstream's torch ops.
 - **Linear layers** (`comfy/ops.py`): plain fp32, fp16 and bf16 linears run on kitchen's
   packed fp16 GEMM in place of rocBLAS, above the size where it is faster. The weight is
   cast straight to fp16 rather than through the input's dtype.
-- **Convolutions** (`comfy/ops.py`): Conv1d, Conv2d, Conv3d and the transposed convs run
-  on kitchen's packed and direct conv kernels in place of MIOpen. A Conv3d whose kernel
-  covers its whole input runs as a linear.
+- **Convolutions** (`comfy/ops.py`): every float Conv1d, Conv2d, Conv3d and transposed
+  conv runs on kitchen's kernels, so MIOpen never runs. MIOpen searches for a kernel on the
+  first call with each new shape (gfx1010 ships no find-db) and its fp32 GEMM solvers take
+  an im2col workspace that has run tiled VAE decodes out of memory; a Flux VAE decode
+  takes 2.3 s on its first call here against 23 s with an empty MIOpen cache. Per conv:
+  - fp32 2D convs at stride 1 or 2 run MIOpen's own fp32 Winograd kernels, built into
+    kitchen (0.7-1.05x MIOpen's warm time, no search);
+  - 1x1 convs, heads of at most 8 output channels and stems with few input channels run
+    kitchen's direct conv;
+  - grouped convs with one filter per channel run the depthwise kernel, other groups
+    run one group at a time;
+  - everything else runs the packed fp16 implicit GEMM, whose 3x3 stride-1 convs take a
+    fused Winograd F(2x2, 3x3) kernel.
+
+  `padding_mode` other than zeros and string padding are applied to the input first, as
+  torch does. Only dilated transposed convs still run on torch. A Conv3d whose kernel
+  covers its whole input runs as a linear. Once warm, MIOpen stays ahead only on 1x1 convs
+  past 256 channels (1.05-1.5x), tiny heads (1.2-1.4x) and small fp16 transposed convs (1.4x).
+- **BatchNorm** (`comfy/ops.py`): eval-mode batch norm runs as one fused multiply-add in
+  torch instead of MIOpen's batch norm.
+- **Model code convs**: `comfy.ops.conv_nd` takes the same route for model code that calls
+  a conv on its own tensors; the LTXV vocoder's STFT uses it. Other raw `F.conv*` calls in
+  model files still run on torch.
 - **Depthwise 1D resampling**: the anti-aliasing filters in the LTXV vocoder, the MMAudio
   VAE and the MiniMax audio VAE use kitchen's depthwise conv kernels.
 - **VAE attention** (`comfy/ldm/modules/diffusionmodules/model.py`): the sliced attention
