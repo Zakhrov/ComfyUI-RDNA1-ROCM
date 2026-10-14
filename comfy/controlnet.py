@@ -426,8 +426,8 @@ class ControlLoraOps:
             w = weight
             if self.up is not None:
                 w = weight + (torch.mm(self.up.flatten(start_dim=1), self.down.flatten(start_dim=1))).reshape(self.weight.shape).type(input.dtype)
-            if comfy.ops._packed_conv_wanted(self, input, w):
-                x = comfy.ops.dense_conv(input, w, bias, self.stride, self.padding, self.dilation)
+            if comfy.ops._rdna1_conv_wanted(input, w):
+                x = comfy.ops.rdna1_conv(self, input, w, bias)
             else:
                 x = torch.nn.functional.conv2d(input, w, bias, self.stride, self.padding, self.dilation, self.groups)
             comfy.ops.uncast_bias_weight(self, weight, bias, offload_stream)

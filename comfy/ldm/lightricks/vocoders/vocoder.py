@@ -596,7 +596,7 @@ class _STFTFn(nn.Module):
             y = y.unsqueeze(1)                                # (B, 1, T)
         left_pad = max(0, self.win_length - self.hop_length)  # causal: left-only
         y = F.pad(y, (left_pad, 0))
-        spec = F.conv1d(y, comfy.model_management.cast_to(self.forward_basis, dtype=y.dtype, device=y.device), stride=self.hop_length, padding=0)
+        spec = comfy.ops.conv_nd(y, comfy.model_management.cast_to(self.forward_basis, dtype=y.dtype, device=y.device), stride=self.hop_length)
         n_freqs = spec.shape[1] // 2
         real, imag = spec[:, :n_freqs], spec[:, n_freqs:]
         magnitude = torch.sqrt(real ** 2 + imag ** 2)

@@ -602,10 +602,8 @@ class disable_weight_init:
             return None
 
         def _conv_forward(self, input, weight, bias):
-            if _direct_conv_wanted(self, input, weight):
-                return direct_conv(input, weight, bias, self.stride, self.padding, self.dilation)
-            if _packed_conv_wanted(self, input, weight):
-                return dense_conv(input, weight, bias, self.stride, self.padding, self.dilation)
+            if _rdna1_conv_wanted(input, weight):
+                return rdna1_conv(self, input, weight, bias)
             return super()._conv_forward(input, weight, bias)
 
         def forward_comfy_cast_weights(self, input):
@@ -624,10 +622,8 @@ class disable_weight_init:
             return None
 
         def _conv_forward(self, input, weight, bias):
-            if _direct_conv_wanted(self, input, weight):
-                return direct_conv(input, weight, bias, self.stride, self.padding, self.dilation)
-            if _packed_conv_wanted(self, input, weight):
-                return dense_conv(input, weight, bias, self.stride, self.padding, self.dilation)
+            if _rdna1_conv_wanted(input, weight):
+                return rdna1_conv(self, input, weight, bias)
             return super()._conv_forward(input, weight, bias)
 
         def forward_comfy_cast_weights(self, input):
@@ -650,10 +646,8 @@ class disable_weight_init:
                 weight = weight[:, :, -input.shape[2]:, :, :]
             if _linear_conv_wanted(self, input, weight):
                 return dense_linear(input.flatten(1), weight.flatten(1), bias).reshape(input.shape[0], -1, 1, 1, 1)
-            if _direct_conv_wanted(self, input, weight):
-                return direct_conv(input, weight, bias, self.stride, self.padding, self.dilation)
-            if _packed_conv_wanted(self, input, weight):
-                return dense_conv(input, weight, bias, self.stride, self.padding, self.dilation)
+            if _rdna1_conv_wanted(input, weight):
+                return rdna1_conv(self, input, weight, bias)
             if NVIDIA_MEMORY_CONV_BUG_WORKAROUND and weight.dtype in (torch.float16, torch.bfloat16):
                 out = torch.cudnn_convolution(input, weight, self.padding, self.stride, self.dilation, self.groups, benchmark=False, deterministic=False, allow_tf32=True)
                 if bias is not None:
@@ -696,11 +690,15 @@ class disable_weight_init:
             with CastBiasWeightContext(self, input, offloadable=True) as (weight, bias):
                 running_mean = self.running_mean.to(device=input.device, dtype=weight.dtype) if self.running_mean is not None else None
                 running_var = self.running_var.to(device=input.device, dtype=weight.dtype) if self.running_var is not None else None
+                if running_mean is not None and not self.training and _rdna1_conv_wanted(input, weight):
+                    return batch_norm_eval(input, running_mean, running_var, weight, bias, self.eps)
                 return torch.nn.functional.batch_norm(input, running_mean, running_var, weight, bias, self.training, self.momentum, self.eps)
 
         def forward(self, *args, **kwargs):
             run_every_op()
-            if self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0:
+            if (self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0
+                    or (self.running_mean is not None and not self.training and self.weight is not None
+                        and _rdna1_conv_wanted(args[0], self.weight))):
                 return self.forward_comfy_cast_weights(*args, **kwargs)
             else:
                 return super().forward(*args, **kwargs)
@@ -750,8 +748,10 @@ class disable_weight_init:
                 num_spatial_dims, self.dilation)
 
             with CastBiasWeightContext(self, input, offloadable=True) as (weight, bias):
-                if _packed_conv_transpose_wanted(self, input, weight):
-                    return dense_conv_transpose(input, weight, bias, self.stride, self.padding, output_padding)
+                if _rdna1_conv_wanted(input, weight):
+                    out = rdna1_conv_transpose(self, input, weight, bias, output_padding)
+                    if out is not None:
+                        return out
                 return torch.nn.functional.conv_transpose2d(
                        input, weight, bias, self.stride, self.padding,
                        output_padding, self.groups, self.dilation)
@@ -771,8 +771,10 @@ class disable_weight_init:
                 num_spatial_dims, self.dilation)
 
             with CastBiasWeightContext(self, input, offloadable=True) as (weight, bias):
-                if _packed_conv_transpose_wanted(self, input, weight):
-                    return dense_conv_transpose(input, weight, bias, self.stride, self.padding, output_padding)
+                if _rdna1_conv_wanted(input, weight):
+                    out = rdna1_conv_transpose(self, input, weight, bias, output_padding)
+                    if out is not None:
+                        return out
                 return torch.nn.functional.conv_transpose1d(
                        input, weight, bias, self.stride, self.padding,
                        output_padding, self.groups, self.dilation)
@@ -1094,54 +1096,98 @@ def dense_bmm(a, b_t):
     return torch.bmm(a, b_t.transpose(1, 2))
 
 
-def _packed_conv_wanted(conv, x, weight):
-    """kitchen's packed conv3d runs on the packed-fp16 GEMM where _packed_linear_wanted would, as
-    an implicit GEMM: no im2col workspace (MIOpen's fp32 one is 9x a 3x3 conv's input), 3-4.5x
-    MIOpen's fp16 conv at Wan VAE shapes and up to 40x its dilated fp32 conv1d at audio VAE shapes
-    on gfx1010. Its gather reads 32 input channels at a time, zero-padding other counts up to
-    that: MIOpen stays ahead once more than a third of them is padding (2-12x at RGB and latent
-    conv_in shapes). MIOpen also keeps the 1x1 convs of a channels-first x, a plain GEMM over x
-    as it lies where the packed one first transposes it (0.3-0.95x; a channels-last x is read
-    in place), and the fp32 2D convs its Winograd kernels serve (0.35-0.85x). The conv runs on
-    weight's device."""
+def _rdna1_conv_wanted(x, weight):
+    """kitchen's rdna1 kernels serve every float conv where its packed GEMM is accelerated
+    (gfx90c, gfx1010), so MIOpen never runs there. MIOpen searches for a kernel on its first
+    call with each new shape (0.2-5 s a shape; gfx1010 ships no find-db) and its fp32 GEMM
+    solvers take an im2col workspace up to 9x x, which has run tiled VAE decodes out of memory.
+    MIOpen's fast fp32 kernels for 2D and transposed convs (Winograd RxS) are built into rdna1
+    (_winograd_wanted, rdna1_conv_transpose). Once warm, MIOpen stays ahead on 1x1 convs past
+    256 channels (1.05-1.35x); rdna1 is ahead on fp16 and bf16 2D convs
+    (0.45-0.75), 3D convs (0.15-0.35), conv1d, depthwise and dilated convs. A whole Flux VAE
+    decode ran 2.3 s on its first call against 23 s with an empty MIOpen cache. The conv runs
+    on weight's device."""
     return (_CK_PACKED and weight.is_cuda and not comfy.model_management.in_training
             and x.dtype in _PACKED_DTYPES and weight.dtype in _PACKED_DTYPES
-            and not isinstance(weight, QuantizedTensor) and -(-x.shape[1] // 32) * 24 <= x.shape[1]
-            and conv.groups == 1 and conv.padding_mode == "zeros" and not isinstance(conv.padding, str)
-            and (weight[0, 0].numel() > 1 or not x.is_contiguous()) and not _miopen_conv2d_wanted(conv, x, weight)
+            and not isinstance(weight, QuantizedTensor)
             and quant_ops.ck.fp16_packed_linear_is_accelerated(weight.device))
 
 
-def _miopen_conv2d_wanted(conv, x, weight):
-    """MIOpen's fp32 2D kernels (Winograd for 3x3) outrun the packed conv up to 5x5 filters and
-    under 128 input channels. Its GEMM solver may instead take an im2col workspace of x's size
-    per filter tap, which has run tiled VAE decodes out of memory here, so a conv whose
-    workspace would not fit twice over stays on the packed conv."""
-    if x.dtype != torch.float32 or weight.dim() != 4 or any(d != 1 for d in conv.dilation):
-        return False
-    if max(weight.shape[2:]) > 5 and x.shape[1] >= 128:
-        return False
-    workspace = x.numel() * weight[0, 0].numel() * 4 // (conv.stride[0] * conv.stride[1])
-    return workspace < 2 ** 28 or 2 * workspace <= comfy.model_management.get_free_memory(weight.device)
+def _conv_padding(conv, x):
+    """x and the zero padding to convolve it with: a padding_mode other than zeros, and string
+    padding that pads one side more than the other, are applied to x, as torch's conv does."""
+    if conv.padding_mode == "zeros" and not isinstance(conv.padding, str):
+        return x, conv.padding
+    pads = conv._reversed_padding_repeated_twice
+    if conv.padding_mode == "zeros" and pads[::2] == pads[1::2]:
+        return x, tuple(pads[::-2])
+    mode = "constant" if conv.padding_mode == "zeros" else conv.padding_mode
+    return torch.nn.functional.pad(x, pads, mode=mode), (0,) * (x.dim() - 2)
 
 
-def _direct_conv_wanted(conv, x, weight):
+def _direct_conv_wanted(x, weight, stride):
     """kitchen's direct conv reads x in place in fp32 math, for the convs the packed one serves
-    badly on gfx1010. At most 8 output channels (an RGB or latent head): 2.7-3.4x the packed conv,
-    2-6x MIOpen's fp16 conv, and level with its fp32 one from 512x512 positions (1.5-2.4x behind
-    below, so those stay on MIOpen). Few input channels (conv_in): 0.4-0.85x MIOpen's time up to
-    64 patch elements in fp32, and level with its fp16 conv up to 160, at stride 1 (its 8-wide
-    load; 1.2x MIOpen's time at stride 2)."""
-    if not (_CK_PACKED and weight.is_cuda and not comfy.model_management.in_training
-            and x.dtype in _PACKED_DTYPES and weight.dtype in _PACKED_DTYPES
-            and not isinstance(weight, QuantizedTensor)
-            and conv.groups == 1 and conv.padding_mode == "zeros" and not isinstance(conv.padding, str)
-            and quant_ops.ck.fp16_packed_linear_is_accelerated(weight.device)):
-        return False
-    fp32 = x.dtype == torch.float32
-    if math.prod(weight.shape[1:]) <= (64 if fp32 else 160) and conv.stride[-1] == 1:
+    badly on gfx1010: at most 8 output channels (an RGB or latent head, 2.7-3.4x the packed
+    conv), and few input channels, which the packed conv's gather zero-pads to 32 (more than a
+    third of them padding; a multiple of 16 takes the packed conv's Winograd path when 3x3). An
+    fp32 conv1d up to 448 patch elements also runs faster here than packed (1.1-1.9x), and so
+    does a 1x1 conv of a channels-first x up to 512 input channels in fp32 and 128 in fp16
+    (1.1-3.9x; the packed conv first transposes x), where it is also level with or ahead of
+    MIOpen's GEMM up to 256 channels."""
+    c = x.shape[1]
+    if weight.shape[0] <= 8:
         return True
-    return weight.shape[0] <= 8 and (not fp32 or math.prod(x.shape[2:]) >= 2 ** 18 * math.prod(conv.stride))
+    if weight[0, 0].numel() == 1 and x.is_contiguous() and c <= (512 if x.dtype == torch.float32 else 128):
+        return True
+    if -(-c // 32) * 24 > c and (c % 16 or weight.shape[-2:] != (3, 3) or any(s != 1 for s in stride[-2:])):
+        return True
+    return (weight.dim() == 3 and x.dtype == torch.float32 and stride[-1] == 1
+            and math.prod(weight.shape[1:]) <= 448)
+
+
+def _winograd_wanted(x, weight, stride, dilation):
+    """kitchen's fp32_winograd_conv2d runs MIOpen's own fp32 Winograd RxS kernels for gfx10,
+    built into the rdna1 backend: MIOpen's warm speed on a 2D conv at stride 1 or 2 without its
+    search on each new shape, in fp32 math (rdna1's packed fp16 Winograd took 1.2-2.8x its
+    time and ~1000x its error; 0.7-1.05x MIOpen's own time now). The direct conv stays ahead on
+    1x1 convs (2-5x), on 1-3 input channels at stride 1 (1.2-1.4x) and on heads of at most 8
+    channels from 512x512 positions (1.1-1.2x)."""
+    return (x.dtype == torch.float32 and weight.dtype == torch.float32 and weight.dim() == 4
+            and weight[0, 0].numel() > 1 and stride[0] == stride[1] and stride[0] in (1, 2)
+            and all(d == 1 for d in dilation) and (x.shape[1] > 3 or stride[0] == 2)
+            and (weight.shape[0] > 8 or math.prod(x.shape[2:]) < 2 ** 18))
+
+
+def _rdna1_conv_one_group(x, weight, bias, stride, padding, dilation):
+    if _winograd_wanted(x, weight, stride, dilation):
+        return quant_ops.ck.fp32_winograd_conv2d(x, weight, bias, stride, padding)
+    if _direct_conv_wanted(x, weight, stride):
+        return direct_conv(x, weight, bias, stride, padding, dilation)
+    return dense_conv(x, weight, bias, stride, padding, dilation)
+
+
+def conv_nd(x, weight, bias=None, stride=1, padding=0, dilation=1):
+    """torch's conv1d, conv2d or conv3d (one group, zero padding) for model code calling a conv
+    on its own tensors, on kitchen's rdna1 kernels where _rdna1_conv_wanted."""
+    nd = weight.dim() - 2
+    stride, padding, dilation = (torch.nn.modules.utils._ntuple(nd)(v) for v in (stride, padding, dilation))
+    if _rdna1_conv_wanted(x, weight):
+        return _rdna1_conv_one_group(x, weight, bias, stride, padding, dilation)
+    return (torch.nn.functional.conv1d, torch.nn.functional.conv2d, torch.nn.functional.conv3d)[nd - 1](
+        x, weight, bias, stride, padding, dilation)
+
+
+def rdna1_conv(conv, x, weight, bias):
+    """conv1d, conv2d or conv3d of conv's settings on kitchen's rdna1 kernels."""
+    x, padding = _conv_padding(conv, x)
+    stride, dilation, groups = conv.stride, conv.dilation, conv.groups
+    if groups == 1:
+        return _rdna1_conv_one_group(x, weight, bias, stride, padding, dilation)
+    if weight.shape[:2] == (x.shape[1], 1):
+        return depthwise_conv(x, weight, bias, stride, padding, dilation)
+    biases = [None] * groups if bias is None else bias.chunk(groups)
+    return torch.cat([_rdna1_conv_one_group(xg, wg, bg, stride, padding, dilation)
+                      for xg, wg, bg in zip(x.chunk(groups, 1), weight.chunk(groups), biases)], 1)
 
 
 def direct_conv(x, weight, bias, stride, padding, dilation):
@@ -1152,6 +1198,17 @@ def direct_conv(x, weight, bias, stride, padding, dilation):
     out = quant_ops.ck.direct_conv3d(x.reshape(*x.shape[:2], *lead, *x.shape[2:]),
                                      weight.reshape(*weight.shape[:2], *lead, *weight.shape[2:]), bias,
                                      (*lead, *stride), (*zeros, *padding), (*lead, *dilation))
+    return out.reshape(*out.shape[:2], *out.shape[2 + len(lead):])
+
+
+def depthwise_conv(x, weight, bias, stride, padding, dilation):
+    """conv1d, conv2d or conv3d with one filter per channel on kitchen's depthwise kernel, the
+    missing leading spatial dims as size one."""
+    lead = (1,) * (5 - x.dim())
+    zeros = tuple(0 for _ in lead)
+    out = quant_ops.ck.depthwise_conv3d(x.reshape(*x.shape[:2], *lead, *x.shape[2:]),
+                                        weight.reshape(*weight.shape[:2], *lead, *weight.shape[2:]), bias,
+                                        (*lead, *stride), (*zeros, *padding), (*lead, *dilation))
     return out.reshape(*out.shape[:2], *out.shape[2 + len(lead):])
 
 
@@ -1172,33 +1229,67 @@ def dense_conv(x, weight, bias, stride, padding, dilation):
     return out.reshape(*out.shape[:2], *out.shape[2 + len(lead):])
 
 
-def _packed_conv_transpose_wanted(conv, x, weight):
-    """kitchen's packed transposed conv runs one stride-1 implicit GEMM per output phase: 13-25x
-    MIOpen's fp16 transposed conv at audio VAE upsampler shapes on gfx1010. Inputs of up to 640
-    positions stay on MIOpen: its fp16 path is still quick there and the per-call re-layout of
-    the weight costs more than the GEMM (0.2-0.7x). MIOpen's fp32 path does not fall off, so
-    fp32 inputs come here only from 1024 channels and 4096 positions (1.1-1.35x, 0.5-1.0x
-    below). The epilogue writes 8 output channels at a time."""
-    positions = x.numel() // x.shape[1]
-    return (_CK_PACKED and weight.is_cuda and not comfy.model_management.in_training
-            and x.dtype in _PACKED_DTYPES and weight.dtype in _PACKED_DTYPES
-            and not isinstance(weight, QuantizedTensor) and -(-x.shape[1] // 32) * 24 <= x.shape[1]
-            and positions > (640 if x.dtype != torch.float32 else 4095)
-            and (x.dtype != torch.float32 or x.shape[1] >= 1024)
-            and conv.groups == 1 and weight.shape[1] % 8 == 0 and all(d == 1 for d in conv.dilation)
-            and quant_ops.ck.fp16_packed_linear_is_accelerated(weight.device))
+def rdna1_conv_transpose(conv, x, weight, bias, output_padding):
+    """conv_transpose1d or 2d of conv's settings on kitchen's rdna1 kernels, or None for a
+    dilated one, which they do not serve. One filter per channel takes the depthwise kernel,
+    other groups the packed transposed conv one at a time."""
+    if any(d != 1 for d in conv.dilation):
+        return None
+    groups = conv.groups
+    if groups == 1 and x.dtype == torch.float32 and weight.dtype == torch.float32 and conv.stride[0] in (1, 2) \
+            and all(s == conv.stride[0] for s in conv.stride) and x.shape[-1] * conv.stride[0] + weight.shape[-1] < 2 ** 16:
+        # MIOpen's fp32 Winograd kernels as its backward data runs them (2-5x the packed
+        # transposed conv, level with MIOpen); a 1D conv as one row of a 2D one. The kernels
+        # index extents in 16 bits, so a longer 1D output stays on the packed conv.
+        if x.dim() == 3:
+            st = conv.stride[0]
+            return quant_ops.ck.fp32_winograd_conv_transpose2d(
+                x[:, :, None], weight[:, :, None], bias, (st, st), (0, *conv.padding),
+                (0, *output_padding)).squeeze(2)
+        return quant_ops.ck.fp32_winograd_conv_transpose2d(x, weight, bias, conv.stride, conv.padding,
+                                                           output_padding)
+    if groups == 1:
+        return dense_conv_transpose(x, weight, bias, conv.stride, conv.padding, output_padding)
+    if weight.shape[:2] == (x.shape[1], 1):
+        lead = (1,) * (5 - x.dim())
+        zeros = tuple(0 for _ in lead)
+        out = quant_ops.ck.depthwise_conv_transpose3d(x.reshape(*x.shape[:2], *lead, *x.shape[2:]),
+                                                      weight.reshape(*weight.shape[:2], *lead, *weight.shape[2:]), bias,
+                                                      (*lead, *conv.stride), (*zeros, *conv.padding), (*zeros, *output_padding))
+        return out.reshape(*out.shape[:2], *out.shape[2 + len(lead):])
+    biases = [None] * groups if bias is None else bias.chunk(groups)
+    return torch.cat([dense_conv_transpose(xg, wg, bg, conv.stride, conv.padding, output_padding)
+                      for xg, wg, bg in zip(x.chunk(groups, 1), weight.chunk(groups), biases)], 1)
 
 
 def dense_conv_transpose(x, weight, bias, stride, padding, output_padding):
     """conv_transpose1d, 2d or 3d on kitchen's packed transposed conv3d, in x's dtype, the
-    missing leading spatial dims as size one. The weight is taken to fp16 as in dense_linear."""
+    missing leading spatial dims as size one. The weight is taken to fp16 as in dense_linear;
+    output channels are zero-padded to the epilogue's 8 and dropped, as in dense_conv."""
     lead = (1,) * (5 - x.dim())
     x = x.reshape(*x.shape[:2], *lead, *x.shape[2:])
     weight = weight.to(torch.float16).reshape(*weight.shape[:2], *lead, *weight.shape[2:])
     zeros = tuple(0 for _ in lead)
+    k = weight.shape[1]
+    if k % 8:
+        weight = torch.nn.functional.pad(weight, (0, 0, 0, 0, 0, 0, 0, 8 - k % 8))
+        bias = None if bias is None else torch.nn.functional.pad(bias, (0, 8 - k % 8))
     out = quant_ops.ck.fp16_packed_conv_transpose3d(x, weight, bias, (*lead, *stride), (*zeros, *padding),
-                                                    (*zeros, *output_padding))
+                                                    (*zeros, *output_padding))[:, :k]
     return out.reshape(*out.shape[:2], *out.shape[2 + len(lead):])
+
+
+def batch_norm_eval(x, running_mean, running_var, weight, bias, eps):
+    """batch_norm with running statistics as one fused multiply-add per element in torch, so
+    MIOpen's batch norm, which loads the library, never runs."""
+    scale = torch.rsqrt(running_var.to(x.dtype) + eps)
+    if weight is not None:
+        scale = scale * weight
+    shift = -running_mean.to(x.dtype) * scale
+    if bias is not None:
+        shift = shift + bias
+    shape = (1, -1) + (1,) * (x.dim() - 2)
+    return torch.addcmul(shift.view(shape), x, scale.view(shape))
 
 
 def _depthwise_wanted(x):
