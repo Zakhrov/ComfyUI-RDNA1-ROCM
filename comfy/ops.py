@@ -2146,12 +2146,15 @@ def use_quantized_matmul(model, device):
     try:
         for module in model.modules():
             if isinstance(module, MixedPrecisionOp) and module.can_use_quantized_matmul(disabled):
-                previous.append((module, module._full_precision_mm))
+                # a TE's fp32 compute dtype force-casts weights on a non-dynamic load, which would dequantize them too
+                previous.append((module, module._full_precision_mm, getattr(module, "comfy_force_cast_weights", False)))
                 module._full_precision_mm = False
+                module.comfy_force_cast_weights = False
         yield
     finally:
-        for module, full_precision_mm in previous:
+        for module, full_precision_mm, force_cast_weights in previous:
             module._full_precision_mm = full_precision_mm
+            module.comfy_force_cast_weights = force_cast_weights
 
 
 def pick_operations(weight_dtype, compute_dtype, load_device=None, disable_fast_fp8=False, fp8_optimizations=False, model_config=None):

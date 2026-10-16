@@ -256,8 +256,8 @@ class GatedDeltaNet(nn.Module):
                 for s in range(seq_len - 1):
                     past_key_value.snapshots[s][1].copy_(combined[:, :, 1 + s:1 + s + self.conv_kernel_size - 1])
             past_key_value.conv_state.copy_(combined[:, :, seq_len:])
-            with comfy.ops.CastBiasWeightContext(self.conv1d, combined, offloadable=True) as (conv_weight, conv_bias):
-                mixed_qkv = F.silu(F.conv1d(combined, conv_weight, conv_bias, groups=self.conv1d.groups))
+            with comfy.ops.CastBiasWeightContext(self.conv1d, combined, offloadable=True) as (conv_weight, _conv_bias):
+                mixed_qkv = F.silu(comfy.ops.depthwise_conv1d(combined, conv_weight, 1))
         else:
             if past_key_value is not None:
                 conv_state = past_key_value.conv_state
@@ -782,6 +782,8 @@ class Qwen35(BaseLlama, BaseGenerate, torch.nn.Module):
         head = self.model.lm_head if hasattr(self.model, "lm_head") else self.model.embed_tokens
 
         def verify_logits(x):
+            if hasattr(self.model, "lm_head"):
+                return head(x)
             if not head.comfy_cast_weights:
                 return comfy.ops.dense_linear(x, head.weight)
             dtype = torch.float16 if len(head.weight_function) == 0 and comfy.ops._packed_linear_wanted(x, head.weight) else None

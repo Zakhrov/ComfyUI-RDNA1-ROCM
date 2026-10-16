@@ -971,7 +971,8 @@ def optimized_attention_for_device(device, mask=False, small_input=False):
         if model_management.pytorch_attention_enabled():
             return attention_pytorch #TODO: need to confirm but this is probably slightly faster for small inputs in all cases
         else:
-            return attention_basic
+            # same math and speed as attention_basic, but chunked to free memory: an LLM prefill's scores (0.9 GB at 2.6k tokens) fit beside resident weights
+            return attention_split
 
     if device == torch.device("cpu"):
         return attention_sub_quad

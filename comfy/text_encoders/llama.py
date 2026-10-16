@@ -1128,10 +1128,11 @@ class BaseGenerate:
     def logits(self, x):
         input = x[:, -1:]
         if hasattr(self.model, "lm_head"):
-            module = self.model.lm_head
-        else:
-            module = self.model.embed_tokens
+            # through the op, so a quantized head runs its own GEMM instead of a full dequantize; 2D
+            # because the strided [:, -1:] slice makes linear decompose to an expand+bmm that int8 can't take
+            return self.model.lm_head(x[:, -1]).unsqueeze(1)
 
+        module = self.model.embed_tokens
         if not module.comfy_cast_weights:
             return comfy.ops.dense_linear(input, module.weight)
         # the packed GEMV reads the table as fp16: cast straight to it instead of via input's dtype
