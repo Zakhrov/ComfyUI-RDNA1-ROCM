@@ -95,7 +95,8 @@ class MiniMaxMusic3TEModel(MiniMaxMusic3AR):
         max_audio_frames = token_weight_pairs["max_audio_frames"]
         cfg_scale = token_weight_pairs["cfg_scale"]
         top_k = token_weight_pairs["top_k"]
-        hidden = self.generate(input_ids, seed, max_audio_frames, self.execution_device, cfg_scale, top_k)
+        with comfy.ops.use_quantized_matmul(self, self.execution_device):
+            hidden = self.generate(input_ids, seed, max_audio_frames, self.execution_device, cfg_scale, top_k)
         return hidden.unsqueeze(0), None, {}
 
     def load_state_dict(self, state_dict, strict=True, assign=False):

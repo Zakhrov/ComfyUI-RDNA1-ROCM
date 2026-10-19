@@ -590,7 +590,7 @@ class disable_weight_init:
 
         def forward_comfy_cast_weights(self, input):
             # the packed GEMM takes the weight in fp16: cast straight to it instead of via input's dtype
-            dtype = torch.float16 if len(self.weight_function) == 0 and _packed_linear_wanted(input, self.weight) else None
+            dtype = _packed_weight_dtype(input, self.weight) if len(self.weight_function) == 0 and _packed_linear_wanted(input, self.weight) else None
             with CastBiasWeightContext(self, input, dtype=dtype, bias_dtype=input.dtype, offloadable=True) as (weight, bias):
                 return dense_linear(input, weight, bias)
 
@@ -1064,12 +1064,17 @@ def _packed_linear_wanted(x, weight):
             and quant_ops.ck.fp16_packed_linear_is_accelerated(x.device))
 
 
+def _packed_weight_dtype(x, weight):
+    # up to 8 rows the packed path's GEMV reads a bf16 or fp32 weight in place, so decode casts none
+    return weight.dtype if x.numel() <= 8 * x.shape[-1] else torch.float16
+
+
 def dense_linear(x, weight, bias=None):
     """``linear(x)`` for a plain float weight, on kitchen's packed-fp16 GEMM where that is faster.
     There the weight is taken to fp16 (one past fp16's range overflows to inf rather than being
     clamped) and x is scaled per row so no fp16 partial sum overflows; error is ~1e-3 of fp32."""
     if _packed_linear_wanted(x, weight):
-        weight = weight.to(dtype=torch.float16, memory_format=torch.contiguous_format)
+        weight = weight.to(dtype=_packed_weight_dtype(x, weight), memory_format=torch.contiguous_format)
         return quant_ops.ck.fp16_packed_linear(x, weight, bias, out_dtype=x.dtype)
     return torch.nn.functional.linear(x, weight.to(x.dtype), bias)
 
@@ -1352,7 +1357,9 @@ def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0,
         out = linear(_eager_input_act(x, input_act, act_weight, act_eps))
         return _linear_residual(out, residual, residual_scale)
 
+    # A quantized weight keeps its storage dtype: casting it to x.dtype would dequantize it.
     with CastBiasWeightContext(linear, x, offloadable=True,
+                               dtype=weight.dtype if quantized else None, bias_dtype=x.dtype,
                                compute_dtype=x.dtype if quantized else None,
                                want_requant=quantized) as (weight, bias):
         if not quantized:
@@ -1784,7 +1791,8 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                     compute_dtype=compute_dtype,
                     want_requant=True,
                 ) as (weight, bias):
-                    weight = weight.to(dtype=input.dtype)
+                    # Only the dequantize fallback reads orig_dtype; weight.to(dtype) would clone the qdata on every call.
+                    weight = weight._copy_with(params=dataclasses.replace(weight.params, orig_dtype=input.dtype), clone_params=False)
                     return self._forward(input, weight, bias)
 
             def forward(self, input, *args, **kwargs):

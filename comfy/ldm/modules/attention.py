@@ -650,10 +650,21 @@ def _comfy_kitchen_int8_inputs(q, k, v, heads, mask, skip_reshape, enable_gqa):
     return q, k, v, mask, b, dim_head
 
 
+def _attention_comfy_kitchen_exact(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+    # fp32 attention the model needs unquantized: kitchen's fp32 flash kernel where it runs, else SDPA
+    q4, k4, v4, mask4, b, dim_head = _comfy_kitchen_int8_inputs(q, k, v, heads, mask, skip_reshape, kwargs.get("enable_gqa", False))
+    if not comfy_kitchen.float_attention_is_available(q4, k4):
+        return attention_pytorch(q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+    out = comfy_kitchen.float_attention(q4, k4, v4, attn_mask=mask4, scale=kwargs.get("scale", None))
+    if not skip_output_reshape:
+        out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
+    return out
+
+
 @wrap_attn
 def attention_comfy_kitchen_int8(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
     if kwargs.get("low_precision_attention", True) is False and q.dtype == torch.float32:
-        return attention_pytorch(q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+        return _attention_comfy_kitchen_exact(q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
     q, k, v, mask, b, dim_head = _comfy_kitchen_int8_inputs(
         q, k, v, heads, mask, skip_reshape, kwargs.get("enable_gqa", False)
     )
@@ -674,7 +685,7 @@ def _attention_comfy_kitchen_int8_containers(q, k, v, heads, mask=None, attn_pre
     k = k.take()
     v = v.take()
     if kwargs.get("low_precision_attention", True) is False and q.dtype == torch.float32:
-        return attention_pytorch(q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+        return _attention_comfy_kitchen_exact(q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
     q, k, v, mask, b, dim_head = _comfy_kitchen_int8_inputs(
         q, k, v, heads, mask, skip_reshape, kwargs.get("enable_gqa", False)
     )
