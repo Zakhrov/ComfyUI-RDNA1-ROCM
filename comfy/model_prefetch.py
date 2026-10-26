@@ -27,7 +27,8 @@ def _malloc_graph_break():
     logging.debug("Comfy model compiler graph break")
 
 def malloc_graph_enabled(device):
-    return not args.disable_comfy_compiler and comfy.memory_management.aimdo_enabled and comfy.model_management.is_device_cuda(device)
+    return (not args.disable_comfy_compiler and comfy.memory_management.aimdo_enabled and comfy.model_management.is_device_cuda(device)
+            and comfy_aimdo.malloc_graph.supported(device.index))
 
 class _PauseMallocGraph:
     def __init__(self, sync=False):

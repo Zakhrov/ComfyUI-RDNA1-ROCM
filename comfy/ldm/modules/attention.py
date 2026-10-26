@@ -650,15 +650,20 @@ def _comfy_kitchen_int8_inputs(q, k, v, heads, mask, skip_reshape, enable_gqa):
     return q, k, v, mask, b, dim_head
 
 
-def _attention_comfy_kitchen_exact(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
-    # fp32 attention the model needs unquantized: kitchen's fp32 flash kernel where it runs, else SDPA
+def _attention_comfy_kitchen_exact(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, fallback=None, **kwargs):
+    # unquantized attention: kitchen's float flash kernel where it runs, else fallback (SDPA by default)
     q4, k4, v4, mask4, b, dim_head = _comfy_kitchen_int8_inputs(q, k, v, heads, mask, skip_reshape, kwargs.get("enable_gqa", False))
     if not comfy_kitchen.float_attention_is_available(q4, k4):
-        return attention_pytorch(q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+        return (fallback or attention_pytorch)(q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
     out = comfy_kitchen.float_attention(q4, k4, v4, attn_mask=mask4, scale=kwargs.get("scale", None))
     if not skip_output_reshape:
         out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
     return out
+
+
+@wrap_attn
+def attention_comfy_kitchen_float(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+    return _attention_comfy_kitchen_exact(q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, fallback=attention_split, **kwargs)
 
 
 @wrap_attn
@@ -985,8 +990,8 @@ def optimized_attention_for_device(device, mask=False, small_input=False):
         if model_management.pytorch_attention_enabled():
             return attention_pytorch #TODO: need to confirm but this is probably slightly faster for small inputs in all cases
         else:
-            # same math and speed as attention_basic, but chunked to free memory: an LLM prefill's scores (0.9 GB at 2.6k tokens) fit beside resident weights
-            return attention_split
+            # flash kernel where kitchen has one, else attention_basic's math chunked to free memory: an LLM prefill's scores (0.9 GB at 2.6k tokens) fit beside resident weights
+            return attention_comfy_kitchen_float
 
     if device == torch.device("cpu"):
         return attention_sub_quad
