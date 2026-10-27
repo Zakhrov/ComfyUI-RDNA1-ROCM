@@ -75,13 +75,14 @@ class YuE2(nn.Module):
             state = self.vae2llm(state) + time + self.latent_pos_embed(length, x)[None]
             positions = torch.arange(ar_length, ar_length + length, device=x.device)[None]
             rope = precompute_freqs_cis(config.head_dim, positions, config.rope_theta, device=x.device)
-            prefix = context[:, kv_start:kv_end].reshape(batch, ar_length, config.num_hidden_layers, 2, config.num_key_value_heads, config.head_dim)
-            prefix = prefix.permute(2, 3, 0, 4, 1, 5)
             prefetch = comfy.model_prefetch.make_prefetch_queue(list(self.model.layers), x.device, transformer_options)
             for index, layer in enumerate(self.model.layers):
                 comfy.model_prefetch.prefetch_queue_pop(prefetch, x.device, layer, state.dtype)
+                # context is [batch, layer, key/value, token, kv features] in RAM (see model_base.YuE2).
+                key, value = (context[:, index, i, kv_start:kv_end].to(x.device, non_blocking=True)
+                              .view(batch, ar_length, config.num_key_value_heads, config.head_dim).transpose(1, 2) for i in (0, 1))
                 state, _ = layer(state, freqs_cis=rope, optimized_attention=attention,
-                                 past_key_value=(prefix[index, 0], prefix[index, 1], ar_length))
+                                 past_key_value=(key, value, ar_length))
             comfy.model_prefetch.prefetch_queue_pop(prefetch, x.device, None)
             output[..., start:end] = self.llm2vae(self.model.norm(state))[:, 1:-1].transpose(1, 2)
         return output

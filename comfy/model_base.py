@@ -2609,7 +2609,12 @@ class YuE2(BaseModel):
 
     def extra_conds(self, **kwargs):
         out = super().extra_conds(**kwargs)
-        context = kwargs["cross_attn"].to(device=kwargs["device"], dtype=self.get_dtype_inference())
+        config = self.diffusion_model.config
+        context = kwargs["cross_attn"].to(dtype=self.get_dtype_inference())
+        batch, tokens, _ = context.shape
+        # Every TE layer's KV for the whole song: gigabytes for a long one, more than VRAM holds beside
+        # the DiT. It stays in RAM, layer-major, and the DiT copies each layer's slice in as it runs.
+        context = context.view(batch, tokens, config.num_hidden_layers, 2, -1).permute(0, 2, 3, 1, 4).contiguous()
         out["c_crossattn"] = comfy.conds.CONDRegular(context)
         out["yue2_chunks"] = comfy.conds.CONDConstant(kwargs["yue2_chunks"])
         return out
@@ -2618,7 +2623,8 @@ class YuE2(BaseModel):
         return {"c_crossattn": kwargs["cross_attn"].shape}
 
     def memory_required(self, input_shape, cond_shapes={}):
-        context_size = sum(math.prod(shape) for shape in cond_shapes.get("c_crossattn", []))
+        # Only one layer's slice of the context is on the device at a time.
+        context_size = sum(math.prod(shape) for shape in cond_shapes.get("c_crossattn", [])) // self.diffusion_model.config.num_hidden_layers
         return super().memory_required(input_shape, cond_shapes) + context_size * comfy.model_management.dtype_size(self.get_dtype_inference())
 
 
