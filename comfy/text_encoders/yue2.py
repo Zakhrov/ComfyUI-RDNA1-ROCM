@@ -46,15 +46,15 @@ def distribution(logits, recent, step, phase, temperature, top_p, top_k, repetit
     if temperature == 0:
         return scores
     scores /= temperature
-    threshold = scores.topk(min(top_k, scores.shape[-1])).values[..., -1, None]
-    scores.masked_fill_(scores < threshold, -torch.inf)
+    # topk is sorted, so top_p filters its values and both apply as one threshold
+    # (no full-vocab sort/scatter: that scatter intermittently faulted on gfx1010).
+    values = scores.topk(min(top_k, scores.shape[-1])).values
     if top_p < 1:
-        values, indices = scores.sort(descending=True)
         probabilities = values.softmax(-1)
         removed = probabilities.cumsum(-1) - probabilities > top_p
         removed[..., :3 if legacy_off else 1] = False
-        values.masked_fill_(removed, -torch.inf)
-        scores = values.scatter(-1, indices, values)
+        values = values.masked_fill(removed, torch.inf)
+    scores.masked_fill_(scores < values.amin(-1, keepdim=True), -torch.inf)
     return scores
 
 

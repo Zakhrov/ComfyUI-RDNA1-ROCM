@@ -724,8 +724,8 @@ class Attention(nn.Module):
             if seq_length == 1 and fixed_cache.index > 0:
                 # CUDA-graphable decode path.
                 position = fixed_cache.position.view(batch_size, 1, 1, 1).expand_as(xk)
-                fixed_cache.key.scatter_(1, position, xk)
-                fixed_cache.value.scatter_(1, position, xv)
+                fixed_cache.key.scatter_(1, position, xk.to(fixed_cache.key.dtype))
+                fixed_cache.value.scatter_(1, position, xv.to(fixed_cache.value.dtype))
                 output = comfy_kitchen.flash_attention_decode(xq, fixed_cache.key, fixed_cache.value, fixed_cache.seqlen)
                 return self.o_proj(output.view(batch_size, seq_length, self.inner_size)), fixed_cache
 
@@ -964,9 +964,11 @@ class Llama2_(nn.Module):
         if flash_kv:
             pos = torch.empty((batch,), device=device, dtype=torch.int64)
             seqlen = torch.zeros((batch,), device=device, dtype=torch.int32)
+            # fp32 decode reads an fp16 cache (half the VRAM); its products stay fp32
+            cache_dtype = torch.float16 if dtype == torch.float32 else dtype
         for _ in range(self.config.num_hidden_layers):
             if flash_kv:
-                key = torch.empty((batch, capacity, self.config.num_key_value_heads, self.config.head_dim), device=device, dtype=dtype)
+                key = torch.empty((batch, capacity, self.config.num_key_value_heads, self.config.head_dim), device=device, dtype=cache_dtype)
                 value = torch.empty_like(key)
                 caches.append(FixedKV(key, value, 0, pos, seqlen))
             else:
