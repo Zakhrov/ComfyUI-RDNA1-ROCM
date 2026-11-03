@@ -323,7 +323,7 @@ class Attention(nn.Module):
 
         query, key, value = (t.transpose(1, 2) for t in (query, key, value))
         # an int8 decoder already accepts int8 numerics; fp16 keeps exact flash
-        if isinstance(self.to_qkv.weight, comfy.ops.QuantizedTensor) and COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE:
+        if isinstance(self.to_qkv.weight, comfy.ops.QuantizedTensor) and COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE and query.is_cuda:
             out = comfy.quant_ops.ck.int8_attention(query, key, value)
             out = out.transpose(1, 2).reshape(batch_size, seq_len, -1)
         else:

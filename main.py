@@ -78,6 +78,8 @@ if __name__ == "__main__" and args.debug_hang:
 
 import comfy_aimdo.control
 
+comfy_aimdo.control.disable_unusable_vmm()
+
 if enables_dynamic_vram():
     simple_vram_headroom = None if args.reserve_vram is None else int(args.reserve_vram * 1024 ** 3)
     comfy_aimdo.control.init(simple_vram_headroom=simple_vram_headroom, nvml_pressure=not args.disable_nvml_pressure)
