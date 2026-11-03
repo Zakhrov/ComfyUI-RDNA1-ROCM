@@ -5,6 +5,8 @@ import logging
 
 
 def is_equal(x, y):
+    if x is y:
+        return True
     if torch.is_tensor(x) and torch.is_tensor(y):
         return torch.equal(x, y)
     elif isinstance(x, dict) and isinstance(y, dict):
@@ -42,7 +44,7 @@ class CONDRegular:
         return True
 
     def concat(self, others):
-        if not others:
+        if len(others) == 0:
             return self.cond
         conds = [self.cond]
         for x in others:
@@ -69,12 +71,14 @@ class CONDCrossAttn(CONDRegular):
         s1 = self.cond.shape
         s2 = other.cond.shape
         if s1 != s2:
-            if s1[0] != s2[0] or s1[2] != s2[2]: #these 2 cases should not happen
+            if s1[0] != s2[0] or s1[2] != s2[2]:  # these 2 cases should not happen
                 return False
 
             mult_min = math.lcm(s1[1], s2[1])
             diff = mult_min // min(s1[1], s2[1])
-            if diff > 4: #arbitrary limit on the padding because it's probably going to impact performance negatively if it's too much
+            if (
+                diff > 4
+            ):  # arbitrary limit on the padding because it's probably going to impact performance negatively if it's too much
                 return False
         if self.cond.device != other.cond.device:
             logging.warning("WARNING: conds not on same device: skipping concat.")
@@ -82,6 +86,8 @@ class CONDCrossAttn(CONDRegular):
         return True
 
     def concat(self, others):
+        if len(others) == 0:
+            return self.cond
         conds = [self.cond]
         crossattn_max_len = self.cond.shape[1]
         for x in others:
@@ -92,7 +98,9 @@ class CONDCrossAttn(CONDRegular):
         out = []
         for c in conds:
             if c.shape[1] < crossattn_max_len:
-                c = c.repeat(1, crossattn_max_len // c.shape[1], 1) #padding with repeat doesn't change result
+                c = c.repeat(
+                    1, crossattn_max_len // c.shape[1], 1
+                )  # padding with repeat doesn't change result
             out.append(c)
         return torch.cat(out)
 
@@ -121,7 +129,10 @@ class CONDKVCache(CONDConstant):
         return self.cond.keys() == other.cond.keys()
 
     def concat(self, others):
-        return {device: [self.cond[device]] + [c.cond[device] for c in others] for device in self.cond}
+        return {
+            device: [self.cond[device]] + [c.cond[device] for c in others]
+            for device in self.cond
+        }
 
 
 class CONDList(CONDRegular):
@@ -145,6 +156,8 @@ class CONDList(CONDRegular):
         return True
 
     def concat(self, others):
+        if len(others) == 0:
+            return list(self.cond)
         out = []
         for i in range(len(self.cond)):
             o = [self.cond[i]]
