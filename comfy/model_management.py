@@ -526,6 +526,16 @@ try:
 
         logging.info("AMD arch: {}".format(arch))
         logging.info("ROCm version: {}".format(rocm_version))
+        # Torch 2.12+ registers Triton aten overrides (e.g. outer-product bmm). Triton's HIP
+        # backend rejects gfx1010/gfx90c ("unsupported target"), so leave those on ATen.
+        if any(a in arch for a in ("gfx1010", "gfx1011", "gfx1012", "gfx90c")):
+            try:
+                import torch.backends.python_native as python_native
+                if python_native.triton.enabled:
+                    python_native.triton.enabled = False
+                    logging.info("Disabled torch.backends.python_native.triton on %s.", arch)
+            except Exception as e:
+                logging.warning("Could not disable torch python_native triton: %s", e)
         if args.use_split_cross_attention == False and args.use_quad_cross_attention == False:
             if aotriton_supported():  # AMD efficient attention implementation depends on aotriton.
                 if torch_version_numeric >= (2, 7):  # works on 2.6 but doesn't actually seem to improve much
